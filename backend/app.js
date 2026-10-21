@@ -2,6 +2,8 @@ import express from "express";
 import "dotenv/config";
 import { webhookCallback } from "grammy";
 import Kredobot from "./src/bot/Kredobot.js";
+import KredobotWhatsapp from "./src/bot/KredobotWhatsapp.js";
+import { WhatsAppClient } from "./src/bot/WhatsappClient.js";
 
 const { PORT = 3000, PUBLIC_URL, WEBHOOK_SECRET } = process.env;
 
@@ -15,6 +17,8 @@ app.use(express.json());
 
 const kredo = new Kredobot();
 const bot = kredo.bot;
+
+const kredoWhatsapp = new KredobotWhatsapp();
 
 app.get("/", (req, res) => res.send("Kredo is running"));
 
@@ -39,3 +43,6 @@ app.listen(PORT, async () => {
     console.error("Failed to set webhook:", err);
   }
 });
+
+const wa = new WhatsAppClient("1234567890"); // Replace with actual phone number
+await wa.connect();
