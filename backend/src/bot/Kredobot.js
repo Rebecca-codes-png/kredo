@@ -5,7 +5,7 @@ import "dotenv/config";
 import db from "../db/db.js";
 import extractIntent from "../services/intentService.js";
 import { sequentialize } from "@grammyjs/runner";
-import safeReply from "./replyTemplates.js";
+import safeReply, { localizeReplyText } from "./replyTemplates.js";
 
 // Hard cap on how many transfers from a single multi-transfer message we'll
 // queue up. Protects against a mis-parsed message inflating the "transfers"
@@ -39,6 +39,12 @@ class Kredobot {
     this.pinFailures = new Map();
 
     this.bot.use(sequentialize((ctx) => ctx.from?.id.toString()));
+    this.bot.use(async (ctx, next) => {
+      const reply = ctx.reply.bind(ctx);
+      ctx.reply = (text, ...args) =>
+        reply(localizeReplyText(text, this.getLanguage(ctx.from?.id)), ...args);
+      await next();
+    });
 
     // Register all command and message listeners when the class is instantiated.
     this.registerHandlers();
@@ -371,6 +377,19 @@ class Kredobot {
     return rows[0] || null;
   }
 
+  async detectUserLanguage(userId, text) {
+    if (!text?.trim()) return this.getLanguage(userId);
+    try {
+      const result = await extractIntent({ text });
+      const lang = result.lang || "english";
+      this.languages.set(userId, lang);
+      return lang;
+    } catch (error) {
+      console.warn("Could not detect message language:", error);
+      return this.getLanguage(userId);
+    }
+  }
+
   async findBeneficiaryByName(userId, recipientName, recipientBank = null) {
     if (!recipientName) return null;
 
@@ -521,6 +540,42 @@ class Kredobot {
   }
 
   async generateTransferReceiptImage(transferData) {
+    const receiptLabels = {
+      english: {
+        debit: "DEBIT",
+        transactionType: "Transaction Type",
+        transfer: "Transfer",
+        senderName: "Sender Name",
+        sourceInstitution: "Source Institution",
+        beneficiary: "Beneficiary",
+        beneficiaryInstitution: "Beneficiary Institution",
+        transactionDate: "Transaction Date",
+        transactionReference: "Transaction Reference",
+      },
+      pidgin: {
+        debit: "DEBIT",
+        transactionType: "Transaction Type",
+        transfer: "Transfer",
+        senderName: "Sender Name",
+        sourceInstitution: "Source Bank",
+        beneficiary: "Person wey receive am",
+        beneficiaryInstitution: "Receiver Bank",
+        transactionDate: "Transaction Date",
+        transactionReference: "Transaction Reference",
+      },
+      yoruba: {
+        debit: "OWÓ JÁDE",
+        transactionType: "Irú Ìṣòwò",
+        transfer: "Gbigbe owó",
+        senderName: "Orúkọ Olùránṣẹ́",
+        sourceInstitution: "Ilé-ifowópamọ́ Olùránṣẹ́",
+        beneficiary: "Ẹni Tó Gba Owó",
+        beneficiaryInstitution: "Ilé-ifowópamọ́ Ẹni Tó Gba Owó",
+        transactionDate: "Ọjọ́ Ìṣòwò",
+        transactionReference: "Àtọ́kasí Ìṣòwò",
+      },
+    };
+    const labels = receiptLabels[transferData.lang] || receiptLabels.english;
     const logoBuffer = await fs.readFile(
       new URL("../../assets/logo.png", import.meta.url),
     );
@@ -556,31 +611,31 @@ class Kredobot {
         <rect x="70" y="120" width="760" height="950" rx="26" fill="#f2f7f8"/>
         <image href="${logoDataUri}" x="120" y="40" width="220" height="120" preserveAspectRatio="xMidYMid meet"/>
         <text x="662" y="112" font-size="30" fill="#0d7b5d" font-weight="700" font-family="Arial, sans-serif">kredo.</text>
-        <text x="120" y="235" font-size="24" fill="#0f172a" font-weight="700" font-family="Arial, sans-serif">DEBIT</text>
+        <text x="120" y="235" font-size="24" fill="#0f172a" font-weight="700" font-family="Arial, sans-serif">${labels.debit}</text>
         <text x="120" y="330" font-size="64" fill="#111827" font-weight="700" font-family="Arial, sans-serif">₦${safe.amount}</text>
         <rect x="650" y="255" width="120" height="70" rx="14" fill="#0e7f65"/>
         <text x="710" y="300" text-anchor="middle" font-size="42" fill="#ffffff" font-weight="700" font-family="Arial, sans-serif">K</text>
 
         <rect x="95" y="370" width="710" height="560" rx="22" fill="#ffffff" opacity="0.92"/>
-        <text x="130" y="430" font-size="22" fill="#475569" font-family="Arial, sans-serif">Transaction Type</text>
-        <text x="690" y="430" text-anchor="end" font-size="22" fill="#0f172a" font-weight="600" font-family="Arial, sans-serif">Transfer</text>
+        <text x="130" y="430" font-size="22" fill="#475569" font-family="Arial, sans-serif">${labels.transactionType}</text>
+        <text x="690" y="430" text-anchor="end" font-size="22" fill="#0f172a" font-weight="600" font-family="Arial, sans-serif">${labels.transfer}</text>
 
-        <text x="130" y="500" font-size="22" fill="#475569" font-family="Arial, sans-serif">Sender Name</text>
+        <text x="130" y="500" font-size="22" fill="#475569" font-family="Arial, sans-serif">${labels.senderName}</text>
         <text x="690" y="500" text-anchor="end" font-size="22" fill="#0f172a" font-weight="600" font-family="Arial, sans-serif">${safe.senderName}</text>
 
-        <text x="130" y="570" font-size="22" fill="#475569" font-family="Arial, sans-serif">Source Institution</text>
+        <text x="130" y="570" font-size="22" fill="#475569" font-family="Arial, sans-serif">${labels.sourceInstitution}</text>
         <text x="690" y="570" text-anchor="end" font-size="22" fill="#0f172a" font-weight="600" font-family="Arial, sans-serif">${safe.senderBank}</text>
 
-        <text x="130" y="640" font-size="22" fill="#475569" font-family="Arial, sans-serif">Beneficiary</text>
+        <text x="130" y="640" font-size="22" fill="#475569" font-family="Arial, sans-serif">${labels.beneficiary}</text>
         <text x="690" y="640" text-anchor="end" font-size="22" fill="#0f172a" font-weight="600" font-family="Arial, sans-serif">${safe.recipientName}</text>
 
-        <text x="130" y="710" font-size="22" fill="#475569" font-family="Arial, sans-serif">Beneficiary Institution</text>
+        <text x="130" y="710" font-size="22" fill="#475569" font-family="Arial, sans-serif">${labels.beneficiaryInstitution}</text>
         <text x="690" y="710" text-anchor="end" font-size="22" fill="#0f172a" font-weight="600" font-family="Arial, sans-serif">${safe.recipientBank}</text>
 
-        <text x="130" y="780" font-size="22" fill="#475569" font-family="Arial, sans-serif">Transaction Date</text>
+        <text x="130" y="780" font-size="22" fill="#475569" font-family="Arial, sans-serif">${labels.transactionDate}</text>
         <text x="690" y="780" text-anchor="end" font-size="20" fill="#0f172a" font-weight="600" font-family="Arial, sans-serif">${safe.date}</text>
 
-        <text x="130" y="850" font-size="22" fill="#475569" font-family="Arial, sans-serif">Transaction Reference</text>
+        <text x="130" y="850" font-size="22" fill="#475569" font-family="Arial, sans-serif">${labels.transactionReference}</text>
         <text x="690" y="850" text-anchor="end" font-size="18" fill="#0f172a" font-weight="600" font-family="Arial, sans-serif">${safe.reference}</text>
       </svg>
     `;
@@ -649,7 +704,6 @@ class Kredobot {
       await safeReply(ctx, "wrong_pin", {
         lang: this.getLanguage(userId),
       });
-      await ctx.reply(session.pendingQuestion);
       await ctx.reply(session.pendingQuestion);
       return;
     }
@@ -924,6 +978,7 @@ class Kredobot {
 
     const receipt = await this.generateTransferReceiptImage({
       amount,
+      lang: this.getLanguage(userId),
       senderName: senderAccount?.account_name || user.name || "You",
       senderBank,
       recipientName: recipientDisplayName,
@@ -1117,6 +1172,9 @@ What nickname would you like to save this beneficiary as?`,
         // Text messages use .text, photos use .caption, voice notes have neither.
         const text = (ctx.message.text ?? ctx.message.caption ?? "").trim();
         const userId = ctx.from.id;
+        if (!this.sessions.has(userId) && text) {
+          await this.detectUserLanguage(userId, text);
+        }
 
         // Ignore slash commands.
         // They are handled by bot.command().
@@ -1124,6 +1182,7 @@ What nickname would you like to save this beneficiary as?`,
 
         // Allow users to type "signup" without the slash.
         if (text.toLowerCase() === "signup") {
+          await this.detectUserLanguage(userId, text);
           await this.handleSignup(ctx);
           return;
         }
@@ -1625,12 +1684,6 @@ You can now use "${accountName}" when referring to this account. 🇳🇬`,
         // =========================
         // FREE-FORM MESSAGE -> INTENT
         // =========================
-        const existingUser = await this.findByTelegramId(userId);
-        if (!existingUser) {
-          await ctx.reply("Please create an account first. Use /signup.");
-          return;
-        }
-
         try {
           const payload = {};
           if (text) {
@@ -1654,6 +1707,12 @@ You can now use "${accountName}" when referring to this account. 🇳🇬`,
           const intent = await extractIntent(payload);
           this.languages.set(userId, intent.lang || "english");
           console.log("Intent for", ctx.chat.id, ":", intent);
+
+          const existingUser = await this.findByTelegramId(userId);
+          if (!existingUser) {
+            await ctx.reply("Please create an account first. Use /signup.");
+            return;
+          }
 
           if (intent.intent === "cancel_transaction") {
             await this.handleCancelTransaction(ctx, userId);
