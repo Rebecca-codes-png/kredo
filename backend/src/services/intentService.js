@@ -15,6 +15,7 @@ CRITICAL OUTPUT CONTRACT:
 - Do NOT return a bare array, a list, or an object with only transfers.
 - The top-level result MUST look exactly like this shape:
 {
+  "lang": "english | pidgin | yoruba",
   "intent": "transfer_request | balance_check | transaction_history | share_account_details | list_beneficiaries | confirm_transaction | cancel_transaction | unclear",
   "entities": {
     "amount": 0 or null,
@@ -40,6 +41,7 @@ CRITICAL OUTPUT CONTRACT:
   "raw_input": "the original user message"
 }
 - Every key above must exist in the JSON object.
+- Detect the user's dominant language and set lang to exactly "english", "pidgin", or "yoruba". Default to "english" when uncertain.
 - If a field is not mentioned, use null (except recipient_is_self on a transfer, see below).
 - If intent is not transfer_request, then transfers must be an empty array [].
 - If the message contains multiple transfers, keep the top-level intent as transfer_request and put each transfer in the transfers array in order.
@@ -71,6 +73,7 @@ Intent labels:
 - unclear: not enough signal; greetings, chit-chat, short bank-only messages, or vague follow-ups.
 
 Strict rules:
+- Detect the user's dominant language and set lang to exactly "english", "pidgin", or "yoruba". Default to "english" when uncertain.
 - Every entity field must be present in the JSON response. Missing values must be null.
 - Never guess account numbers, bank names, amounts, or names that are not explicitly stated.
 - sender_bank = the bank/wallet sending FROM.
@@ -106,6 +109,7 @@ recipient_name, sender_bank, recipient_is_self.
 Combine information from the image and text.
 Preserve multiple transfers in order.
 Missing values = null.
+Detect the language in the user's text or caption and include lang as exactly "english", "pidgin", or "yoruba". Default to "english" when uncertain.
 
 Return only JSON matching the schema and ensure the top-level result is an object, not an array.
 `.trim();
@@ -118,6 +122,7 @@ Understand Nigerian Pidgin, English, Yoruba, or mixed speech.
 ${OUTPUT_SCHEMA_INSTRUCTIONS}
 
 Extract only information actually spoken. Never guess.
+Detect the spoken language and include lang as exactly "english", "pidgin", or "yoruba". For mixed speech, choose the dominant language. Default to "english" when uncertain.
 
 For transfers:
 - sender_bank = sending FROM
@@ -178,6 +183,7 @@ const TRANSFER_ENTITY_SCHEMA = {
 const INTENT_SCHEMA = {
   type: "object",
   properties: {
+    lang: { type: "string", enum: ["english", "pidgin", "yoruba"] },
     intent: {
       type: "string",
       enum: [
@@ -214,7 +220,14 @@ const INTENT_SCHEMA = {
     confidence: { type: "number" },
     raw_input: { type: "string" },
   },
-  required: ["intent", "entities", "transfers", "confidence", "raw_input"],
+  required: [
+    "lang",
+    "intent",
+    "entities",
+    "transfers",
+    "confidence",
+    "raw_input",
+  ],
 };
 
 /**
@@ -274,6 +287,20 @@ export function normalizeParsedIntent(
 
   const intent =
     rawObject.intent || (transferList.length ? "transfer_request" : "unclear");
+  const languageAliases = {
+    en: "english",
+    english: "english",
+    pcm: "pidgin",
+    pidgin: "pidgin",
+    yo: "yoruba",
+    yoruba: "yoruba",
+  };
+  const lang =
+    languageAliases[
+      String(rawObject.lang || "")
+        .trim()
+        .toLowerCase()
+    ] || "english";
 
   const entities = normalizeEntities(rawObject.entities || {});
 
@@ -304,6 +331,7 @@ export function normalizeParsedIntent(
   }
 
   return {
+    lang,
     intent,
     entities,
     transfers,

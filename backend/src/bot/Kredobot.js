@@ -5,6 +5,7 @@ import "dotenv/config";
 import db from "../db/db.js";
 import extractIntent from "../services/intentService.js";
 import { sequentialize } from "@grammyjs/runner";
+import safeReply from "./replyTemplates.js";
 
 // Hard cap on how many transfers from a single multi-transfer message we'll
 // queue up. Protects against a mis-parsed message inflating the "transfers"
@@ -31,6 +32,8 @@ class Kredobot {
     // Map of userId -> flow session state.
     // Example: { flow: "signup", step: "name|phone|pin", ... }
     this.sessions = new Map();
+    // Most recently detected language per user; used for follow-up turns.
+    this.languages = new Map();
 
     // Map of userId -> { count, lockedUntil } for wrong-PIN tracking.
     this.pinFailures = new Map();
@@ -64,6 +67,10 @@ class Kredobot {
   getPinLockedUntil(userId) {
     const entry = this.pinFailures.get(userId);
     return entry && entry.lockedUntil > Date.now() ? entry.lockedUntil : 0;
+  }
+
+  getLanguage(userId) {
+    return this.languages.get(userId) || "english";
   }
 
   verifyPin(user, entered) {
@@ -119,13 +126,12 @@ class Kredobot {
     return prompts[field] || "Please provide the missing transfer detail.";
   }
 
-  getTransferPinPrompt({ amount, recipientName, recipientBank, senderBank }) {
-    const formattedAmount = Number(amount || 0).toLocaleString("en-NG");
-    const namePart = recipientName ? ` to ${recipientName}` : "";
-    const bankPart = recipientBank ? ` at ${recipientBank}` : "";
-    const sourcePart = senderBank ? ` from your ${senderBank} account` : "";
-
-    return `Enter PIN to transfer ₦${formattedAmount}${namePart}${bankPart}${sourcePart}.`;
+  getTransferPinPrompt({ amount, recipientName, lang = "english" }) {
+    return safeReply(null, "transfer_confirm", {
+      lang,
+      amount,
+      name: recipientName,
+    });
   }
 
   async ensureTransferFollowUp(ctx, userId, intent) {
@@ -178,14 +184,10 @@ class Kredobot {
       const recipientName =
         draft.recipient_name || draft.recipient_account_number || "recipient";
 
-      const senderBank = draft.sender_bank || "your account";
-      const recipientBank = draft.recipient_bank || "recipient bank";
-
       const pinPrompt = this.getTransferPinPrompt({
         amount,
         recipientName,
-        recipientBank,
-        senderBank,
+        lang: this.getLanguage(userId),
       });
 
       this.sessions.set(userId, {
@@ -644,9 +646,10 @@ class Kredobot {
       }
 
       this.pinFailures.set(userId, entry);
-      await ctx.reply(
-        `Incorrect PIN. ${MAX_PIN_ATTEMPTS - entry.count} attempt(s) left.`,
-      );
+      await safeReply(ctx, "wrong_pin", {
+        lang: this.getLanguage(userId),
+      });
+      await ctx.reply(session.pendingQuestion);
       await ctx.reply(session.pendingQuestion);
       return;
     }
@@ -672,9 +675,10 @@ class Kredobot {
         );
     if (!recipientAccount) {
       this.sessions.delete(userId);
-      await ctx.reply(
-        `I couldn't find a matching recipient account for ${recipientName}. Please confirm the recipient first.`,
-      );
+      await safeReply(ctx, "recipient_not_found", {
+        lang: this.getLanguage(userId),
+        name: recipientName,
+      });
       if (batchTotal) {
         batchResults.push({
           label: this.describeTransferDraft(session.draft),
@@ -701,7 +705,9 @@ class Kredobot {
 
     if (Number.isNaN(amount) || amount <= 0) {
       this.sessions.delete(userId);
-      await ctx.reply("Transfer amount is invalid.");
+      await safeReply(ctx, "invalid_amount", {
+        lang: this.getLanguage(userId),
+      });
       if (batchTotal) {
         batchResults.push({
           label: this.describeTransferDraft(session.draft),
@@ -721,9 +727,11 @@ class Kredobot {
 
     if (senderBalance < amount) {
       this.sessions.delete(userId);
-      await ctx.reply(
-        `Insufficient balance for this transfer from ${senderBank}. Current balance: ₦${senderBalance.toLocaleString("en-NG")}.`,
-      );
+      await safeReply(ctx, "insufficient_funds", {
+        lang: this.getLanguage(userId),
+        amount,
+        name: recipientName,
+      });
       if (batchTotal) {
         batchResults.push({
           label: this.describeTransferDraft(session.draft),
@@ -838,9 +846,11 @@ class Kredobot {
         // Someone else spent the balance between our earlier check and now.
         await conn.rollback();
         this.sessions.delete(userId);
-        await ctx.reply(
-          `Insufficient balance for this transfer from ${senderBank}.`,
-        );
+        await safeReply(ctx, "insufficient_funds", {
+          lang: this.getLanguage(userId),
+          amount,
+          name: recipientName,
+        });
         if (batchTotal) {
           batchResults.push({
             label: this.describeTransferDraft(session.draft),
@@ -890,9 +900,9 @@ class Kredobot {
       await conn.rollback();
       console.error("Transfer transaction failed:", err);
       this.sessions.delete(userId);
-      await ctx.reply(
-        "Something went wrong while processing your transfer. Please try again.",
-      );
+      await safeReply(ctx, "generic_error", {
+        lang: this.getLanguage(userId),
+      });
       if (batchTotal) {
         batchResults.push({
           label: this.describeTransferDraft(session.draft),
@@ -931,22 +941,23 @@ class Kredobot {
 
     this.sessions.delete(userId);
 
-    await ctx.reply(
-      `✅ TRANSACTION SUCCESSFUL
-
-You sent ₦${amount.toLocaleString("en-NG")} to ${recipientDisplayName}.
-Reference: ${reference}
-
-Your receipt is below.`,
-    );
+    await safeReply(ctx, "transfer_success", {
+      lang: this.getLanguage(userId),
+      amount,
+      name: recipientDisplayName,
+      reference,
+    });
 
     try {
       await ctx.replyWithPhoto(new InputFile(receipt, "kredo-receipt.png"));
     } catch (photoErr) {
       console.error("Receipt photo failed to send:", photoErr);
-      await ctx.reply(
-        `Transfer complete. Reference: ${reference}\nAmount: ₦${amount.toLocaleString("en-NG")}`,
-      );
+      await safeReply(ctx, "transfer_success", {
+        lang: this.getLanguage(userId),
+        amount,
+        name: recipientDisplayName,
+        reference,
+      });
     }
 
     if (batchTotal) {
@@ -1195,8 +1206,7 @@ What nickname would you like to save this beneficiary as?`,
               session.pendingQuestion = this.getTransferPinPrompt({
                 amount: Number(session.draft.amount),
                 recipientName: beneficiary.nickname,
-                recipientBank: beneficiary.bank_name || "recipient bank",
-                senderBank: session.draft.sender_bank || "your account",
+                lang: this.getLanguage(userId),
               });
               await ctx.reply(session.pendingQuestion);
               return;
@@ -1297,9 +1307,10 @@ What nickname would you like to save this beneficiary as?`,
 
           if (!recipientAccount) {
             this.sessions.delete(userId);
-            await ctx.reply(
-              `I couldn't find a recipient account for ${recipientName}. Please add the recipient first or send the correct account details.`,
-            );
+            await safeReply(ctx, "recipient_not_found", {
+              lang: this.getLanguage(userId),
+              name: recipientName,
+            });
             if (batchTotal) {
               batchResults.push({
                 label: this.describeTransferDraft(session.draft),
@@ -1326,9 +1337,11 @@ What nickname would you like to save this beneficiary as?`,
 
           if (senderBalance < amount) {
             this.sessions.delete(userId);
-            await ctx.reply(
-              `Insufficient balance for this transfer from ${senderBank}. Current balance: ₦${senderBalance.toLocaleString("en-NG")}.`,
-            );
+            await safeReply(ctx, "insufficient_funds", {
+              lang: this.getLanguage(userId),
+              amount,
+              name: recipientName,
+            });
             if (batchTotal) {
               batchResults.push({
                 label: this.describeTransferDraft(session.draft),
@@ -1377,8 +1390,7 @@ What nickname would you like to save this beneficiary as?`,
           session.pendingQuestion = this.getTransferPinPrompt({
             amount,
             recipientName: recipientDisplayName,
-            recipientBank: session.draft.recipient_bank || "recipient bank",
-            senderBank: session.draft.sender_bank || "your account",
+            lang: this.getLanguage(userId),
           });
           session.draft.recipient_name = recipientDisplayName;
           await ctx.reply(session.pendingQuestion);
@@ -1640,6 +1652,7 @@ You can now use "${accountName}" when referring to this account. 🇳🇬`,
           }
 
           const intent = await extractIntent(payload);
+          this.languages.set(userId, intent.lang || "english");
           console.log("Intent for", ctx.chat.id, ":", intent);
 
           if (intent.intent === "cancel_transaction") {
@@ -1717,14 +1730,14 @@ You can now use "${accountName}" when referring to this account. 🇳🇬`,
           }
 
           // Fallback so the bot never goes silent on an unknown intent.
-          await ctx.reply(
-            'I didn\'t quite get that. You can ask for your balance or tell me to send money, e.g. "send 5000 to 7031272572 on Opay".',
-          );
+          await safeReply(ctx, "not_understood", {
+            lang: this.getLanguage(userId),
+          });
         } catch (err) {
           console.error("Intent extraction failed:", err);
-          await ctx.reply(
-            "I couldn't understand that message properly. Please try again.",
-          );
+          await safeReply(ctx, "generic_error", {
+            lang: this.getLanguage(userId),
+          });
         }
 
         console.log(`User ${userId} sent: ${text || "[media]"}`);
@@ -2191,7 +2204,9 @@ You can now use "${accountName}" when referring to this account. 🇳🇬`,
     this.sessions.delete(userId);
 
     if (session.flow !== "transfer") {
-      await ctx.reply("Okay, cancelled.");
+      await safeReply(ctx, "transfer_cancelled", {
+        lang: this.getLanguage(userId),
+      });
       return true;
     }
 
@@ -2206,7 +2221,9 @@ You can now use "${accountName}" when referring to this account. 🇳🇬`,
       });
     }
 
-    await ctx.reply("Transaction cancelled. No money was sent.");
+    await safeReply(ctx, "transfer_cancelled", {
+      lang: this.getLanguage(userId),
+    });
 
     // Cancelling only skips the current transfer; the rest of the batch continues.
     if (batchTotal) {
