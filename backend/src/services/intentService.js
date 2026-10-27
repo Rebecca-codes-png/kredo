@@ -38,13 +38,15 @@ CRITICAL OUTPUT CONTRACT:
     }
   ],
   "confidence": 0.0,
-  "raw_input": "the original user message"
+  "raw_input": "the original user message, or a verbatim transcript when the input is audio"
 }
 - Every key above must exist in the JSON object.
 - Detect the user's dominant language and set lang to exactly "english", "pidgin", or "yoruba". Default to "english" when uncertain.
 - If a field is not mentioned, use null (except recipient_is_self on a transfer, see below).
 - If intent is not transfer_request, then transfers must be an empty array [].
 - If the message contains multiple transfers, keep the top-level intent as transfer_request and put each transfer in the transfers array in order.
+- Amounts are financially sensitive: preserve the amount exactly as stated. A bare "500" means 500, never 5,000. Multiply by 1,000 only when the user explicitly says "k" or "thousand" (for example, "5k" = 5000). Do not infer, round, or add zeros.
+- For audio, carefully distinguish spoken "five hundred" (500) from "five thousand" (5000). If the amount is unclear, return null rather than guessing. Set raw_input to a verbatim transcript, preserving the spoken amount accurately.
 - Never output just the transfers array by itself.
 - recipient_is_self = true when the money goes to the user's OWN account
   ("to my opay", "my other account", "myself", "to my GTB").
@@ -76,6 +78,7 @@ Strict rules:
 - Detect the user's dominant language and set lang to exactly "english", "pidgin", or "yoruba". Default to "english" when uncertain.
 - Every entity field must be present in the JSON response. Missing values must be null.
 - Never guess account numbers, bank names, amounts, or names that are not explicitly stated.
+- Preserve numeric transfer amounts literally: "500" is 500, not 5000. Apply a thousand multiplier only for an explicit "k" or "thousand" suffix/word. If unsure, set amount to null.
 - sender_bank = the bank/wallet sending FROM.
 - recipient_bank = the bank receiving TO.
 - recipient_account_number belongs to recipient_bank.
@@ -122,6 +125,7 @@ Understand Nigerian Pidgin, English, Yoruba, or mixed speech.
 ${OUTPUT_SCHEMA_INSTRUCTIONS}
 
 Extract only information actually spoken. Never guess.
+Transcribe the audio verbatim into raw_input. Preserve amounts exactly: "five hundred" is 500, not 5000; "five thousand" is 5000. If the spoken amount is unclear, set amount to null instead of guessing.
 Detect the spoken language and include lang as exactly "english", "pidgin", or "yoruba". For mixed speech, choose the dominant language. Default to "english" when uncertain.
 
 For transfers:
@@ -257,6 +261,44 @@ function normalizeTransferEntity(entity = {}) {
     normalized[key] = entity[key] ?? null;
   }
   return normalized;
+}
+
+/**
+ * Corrects model-scaled numeric amounts when the user explicitly typed digits
+ * immediately after a transfer verb. A multiplier is applied only when the
+ * input itself explicitly includes "k" or "thousand".
+ * @param {object} intent
+ * @param {string} sourceText
+ */
+function preserveExplicitNumericAmounts(intent, sourceText = "") {
+  if (intent.intent !== "transfer_request") return intent;
+
+  // Restrict extraction to amount positions directly following transfer verbs;
+  // this avoids interpreting recipient account numbers after "to" as amounts.
+  const amountPattern =
+    /\b(?:send|transfer|pay)\s+(?:(?:me|an amount of|the amount of)\s+)?(?:₦\s*|NGN\s*)?(\d[\d,]*(?:\.\d+)?)\s*(k|thousand)?\b/gi;
+  const explicitAmounts = [...String(sourceText).matchAll(amountPattern)].map(
+    ([, rawAmount, unit]) => {
+      const amount = Number(rawAmount.replaceAll(",", ""));
+      return unit ? amount * 1000 : amount;
+    },
+  );
+
+  if (!explicitAmounts.length) return intent;
+
+  const transfers = intent.transfers || [];
+  if (explicitAmounts.length === 1 && transfers.length === 1) {
+    transfers[0].amount = explicitAmounts[0];
+  } else if (explicitAmounts.length === transfers.length) {
+    transfers.forEach((transfer, index) => {
+      transfer.amount = explicitAmounts[index];
+    });
+  } else {
+    return intent;
+  }
+
+  if (transfers.length === 1) intent.entities.amount = transfers[0].amount;
+  return intent;
 }
 
 /**
@@ -410,6 +452,10 @@ async function extractIntent({
   }
 
   parsedIntent = normalizeParsedIntent(parsedIntent, text || "");
+  parsedIntent = preserveExplicitNumericAmounts(
+    parsedIntent,
+    text || parsedIntent.raw_input,
+  );
 
   console.log("Extracted intent:", JSON.stringify(parsedIntent, null, 2));
   return parsedIntent;
