@@ -1164,10 +1164,10 @@ What nickname would you like to save this beneficiary as?`,
     });
 
     // Catch any normal message that is not a command: text, photo (with optional
-    // caption) or voice note. Signup flow, transfer follow-ups and intent
+    // caption), voice note, or uploaded audio. Signup flow, transfer follow-ups and intent
     // extraction all run through here.
     this.bot.on(
-      ["message:text", "message:photo", "message:voice"],
+      ["message:text", "message:photo", "message:voice", "message:audio"],
       async (ctx) => {
         // Text messages use .text, photos use .caption, voice notes have neither.
         const text = (ctx.message.text ?? ctx.message.caption ?? "").trim();
@@ -1698,7 +1698,13 @@ You can now use "${accountName}" when referring to this account. 🇳🇬`,
             payload.audioBase64 = await this.fileToBase64(
               ctx.message.voice.file_id,
             );
-            payload.audioMimeType = "audio/ogg";
+            payload.audioMimeType = ctx.message.voice.mime_type || "audio/ogg";
+          }
+          if (ctx.message.audio) {
+            payload.audioBase64 = await this.fileToBase64(
+              ctx.message.audio.file_id,
+            );
+            payload.audioMimeType = ctx.message.audio.mime_type || "audio/mpeg";
           }
           if (!payload.text && !payload.imageBase64 && !payload.audioBase64) {
             return ctx.reply("Abeg send text, picture, or voice note.");
@@ -1730,7 +1736,10 @@ You can now use "${accountName}" when referring to this account. 🇳🇬`,
           }
 
           if (intent.intent === "transaction_history") {
-            const range = this.resolveHistoryRange(text, intent.entities);
+            const range = this.resolveHistoryRange(
+              text || intent.raw_input,
+              intent.entities,
+            );
             await this.handleTransactionHistory(ctx, userId, range);
             return;
           }

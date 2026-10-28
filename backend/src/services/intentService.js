@@ -117,32 +117,15 @@ Detect the language in the user's text or caption and include lang as exactly "e
 Return only JSON matching the schema and ensure the top-level result is an object, not an array.
 `.trim();
 
-const AUDIO_SYSTEM_PROMPT = `
-Extract fintech intent from the user's voice input.
-
-Understand Nigerian Pidgin, English, Yoruba, or mixed speech.
-
-${OUTPUT_SCHEMA_INSTRUCTIONS}
-
-Extract only information actually spoken. Never guess.
-Transcribe the audio verbatim into raw_input. Preserve amounts exactly: "five hundred" is 500, not 5000; "five thousand" is 5000. If the spoken amount is unclear, set amount to null instead of guessing.
-Detect the spoken language and include lang as exactly "english", "pidgin", or "yoruba". For mixed speech, choose the dominant language. Default to "english" when uncertain.
-
-For transfers:
-- sender_bank = sending FROM
-- recipient_bank = receiving
-- recipient_account_number belongs to recipient_bank
-- Put each distinct transfer in transfers, in order.
-- Missing values = null.
-
-Intents:
-transfer_request, balance_check, transaction_history,
-share_account_details, list_beneficiaries, confirm_transaction,
-cancel_transaction, unclear.
-
-Dates mentioned for transaction_history go in from_date/to_date.
-
-Return a top-level object, never a bare array.
+const AUDIO_TRANSCRIPTION_PROMPT = `
+Transcribe the supplied audio verbatim. The speaker may use Nigerian English,
+Nigerian Pidgin, Yoruba, or a mixture. Keep the original language; do not
+translate, summarize, classify intent, or add words that were not spoken.
+Pay close attention to money amounts, account digits, names, and Nigerian
+bank/wallet names. Keep number words as spoken (for example, do not change
+"five hundred" into "five thousand"). If a word is genuinely inaudible, mark
+only that span as [inaudible]. Return only the transcript, with no label or
+explanation.
 `.trim();
 
 const ENTITY_KEYS = [
@@ -409,19 +392,33 @@ async function extractIntent({
     );
   }
 
-  const SYSTEM_PROMPT = imageBase64
-    ? IMAGE_SYSTEM_PROMPT
-    : audioBase64
-      ? AUDIO_SYSTEM_PROMPT
-      : TEXT_SYSTEM_PROMPT;
+  // Transcribe first, then classify the transcript with the same prompt used
+  // for typed messages. Keeping ASR and intent extraction separate avoids
+  // asking one generation to both decipher speech and satisfy the JSON schema.
+  let audioTranscript = "";
+  let extractionText = text?.trim() || "";
+  if (audioBase64) {
+    const transcription = await ai.interactions.create({
+      model: MODEL,
+      system_instruction: AUDIO_TRANSCRIPTION_PROMPT,
+      input: [{ type: "audio", data: audioBase64, mime_type: audioMimeType }],
+      generation_config: { max_output_tokens: 512, temperature: 0 },
+    });
+    audioTranscript = String(transcription.output_text || "").trim();
+    if (!audioTranscript) {
+      throw new Error("extractIntent: audio transcription returned no text");
+    }
+    extractionText = extractionText
+      ? `Caption/context: ${extractionText}\nSpoken words: ${audioTranscript}`
+      : audioTranscript;
+  }
+
+  const SYSTEM_PROMPT = imageBase64 ? IMAGE_SYSTEM_PROMPT : TEXT_SYSTEM_PROMPT;
 
   const input = [];
-  if (text?.trim()) input.push({ type: "text", text });
+  if (extractionText) input.push({ type: "text", text: extractionText });
   if (imageBase64)
     input.push({ type: "image", data: imageBase64, mime_type: imageMimeType });
-  if (audioBase64)
-    input.push({ type: "audio", data: audioBase64, mime_type: audioMimeType });
-
   const interaction = await ai.interactions.create({
     model: MODEL,
     system_instruction: SYSTEM_PROMPT,
@@ -451,11 +448,12 @@ async function extractIntent({
     );
   }
 
-  parsedIntent = normalizeParsedIntent(parsedIntent, text || "");
+  parsedIntent = normalizeParsedIntent(parsedIntent, extractionText);
   parsedIntent = preserveExplicitNumericAmounts(
     parsedIntent,
-    text || parsedIntent.raw_input,
+    extractionText || parsedIntent.raw_input,
   );
+  if (audioTranscript) parsedIntent.raw_input = audioTranscript;
 
   console.log("Extracted intent:", JSON.stringify(parsedIntent, null, 2));
   return parsedIntent;
