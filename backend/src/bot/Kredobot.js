@@ -1041,6 +1041,13 @@ class Kredobot {
     const file = await this.bot.api.getFile(fileId);
     const url = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
     const res = await fetch(url);
+    console.log("[TELEGRAM FILE]", {
+      file_path: file.file_path,
+      file_size: file.file_size,
+      status: res.status,
+    });
+    if (!res.ok)
+      throw new Error(`Telegram file download failed: ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     return buf.toString("base64");
   }

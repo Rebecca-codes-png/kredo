@@ -7,7 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-3.5-flash-lite";
 
 const OUTPUT_SCHEMA_INSTRUCTIONS = `
 CRITICAL OUTPUT CONTRACT:
@@ -117,15 +117,40 @@ Detect the language in the user's text or caption and include lang as exactly "e
 Return only JSON matching the schema and ensure the top-level result is an object, not an array.
 `.trim();
 
-const AUDIO_TRANSCRIPTION_PROMPT = `
-Transcribe the supplied audio verbatim. The speaker may use Nigerian English,
-Nigerian Pidgin, Yoruba, or a mixture. Keep the original language; do not
-translate, summarize, classify intent, or add words that were not spoken.
-Pay close attention to money amounts, account digits, names, and Nigerian
-bank/wallet names. Keep number words as spoken (for example, do not change
-"five hundred" into "five thousand"). If a word is genuinely inaudible, mark
-only that span as [inaudible]. Return only the transcript, with no label or
-explanation.
+const AUDIO_SYSTEM_PROMPT = `
+You are a fintech intent extractor for spoken Nigerian English, Nigerian
+Pidgin, Yoruba, or mixed speech. Listen to the audio and extract the user's
+intent directly; do not require a separate transcription step.
+
+${OUTPUT_SCHEMA_INSTRUCTIONS}
+
+Apply the same intent rules as typed messages:
+- transfer_request: the user asks to send, pay, or move money.
+- balance_check: the user asks for an account balance.
+- transaction_history: the user asks about past transfers, statements, or history.
+- share_account_details: the user shares their own account details.
+- list_beneficiaries: the user asks to list saved beneficiaries.
+- confirm_transaction: the user confirms a pending action.
+- cancel_transaction: the user cancels or stops a pending action.
+- unclear: greetings, casual chat, bank-only mentions, or insufficient signal.
+
+Extract only information actually spoken. Never guess names, bank names,
+account digits, or amounts. Pay special attention to Nigerian bank and wallet
+names, code-switching, and number words. Preserve amounts exactly: "five
+hundred" is 500, not 5000; "five thousand" is 5000. If an amount or account
+digit is unclear, use null rather than guessing.
+
+For transfers, identify the sending bank separately from the receiving bank.
+Put each distinct transfer in transfers[] in spoken order. Populate date
+entities for history requests. Set raw_input to the closest verbatim transcript
+you can infer, preserving the original language and spoken amount.
+
+Greetings and casual chat are unclear unless the user clearly asks for a
+financial action. A bank name alone is unclear. Date words such as yesterday,
+today, last week, or last month indicate transaction_history.
+If the audio is silent or unintelligible, use intent "unclear", confidence 0
+and raw_input "".
+Return only JSON matching the schema.
 `.trim();
 
 const ENTITY_KEYS = [
@@ -367,9 +392,10 @@ export function normalizeParsedIntent(
 }
 
 /**
- * Extracts structured intent from raw Pidgin text input.
+ * Extracts structured intent from text, an image, or a voice note in a
+ * single multimodal Gemini call.
  * @param {object} params
- * @param {string} [params.text] - Raw text (from Telegram message, OCR, or ASR transcript)
+ * @param {string} [params.text] - Raw text (Telegram message or caption)
  * @param {string} [params.imageBase64]
  * @param {string} [params.imageMimeType]
  * @param {string} [params.audioBase64]
@@ -392,33 +418,20 @@ async function extractIntent({
     );
   }
 
-  // Transcribe first, then classify the transcript with the same prompt used
-  // for typed messages. Keeping ASR and intent extraction separate avoids
-  // asking one generation to both decipher speech and satisfy the JSON schema.
-  let audioTranscript = "";
-  let extractionText = text?.trim() || "";
-  if (audioBase64) {
-    const transcription = await ai.interactions.create({
-      model: MODEL,
-      system_instruction: AUDIO_TRANSCRIPTION_PROMPT,
-      input: [{ type: "audio", data: audioBase64, mime_type: audioMimeType }],
-      generation_config: { max_output_tokens: 512, temperature: 0 },
-    });
-    audioTranscript = String(transcription.output_text || "").trim();
-    if (!audioTranscript) {
-      throw new Error("extractIntent: audio transcription returned no text");
-    }
-    extractionText = extractionText
-      ? `Caption/context: ${extractionText}\nSpoken words: ${audioTranscript}`
-      : audioTranscript;
-  }
+  const SYSTEM_PROMPT = imageBase64
+    ? IMAGE_SYSTEM_PROMPT
+    : audioBase64
+      ? AUDIO_SYSTEM_PROMPT
+      : TEXT_SYSTEM_PROMPT;
 
-  const SYSTEM_PROMPT = imageBase64 ? IMAGE_SYSTEM_PROMPT : TEXT_SYSTEM_PROMPT;
-
+  // One multimodal call: text, image and audio all go in together.
   const input = [];
-  if (extractionText) input.push({ type: "text", text: extractionText });
+  if (text?.trim()) input.push({ type: "text", text: text.trim() });
   if (imageBase64)
     input.push({ type: "image", data: imageBase64, mime_type: imageMimeType });
+  if (audioBase64)
+    input.push({ type: "audio", data: audioBase64, mime_type: audioMimeType });
+
   const interaction = await ai.interactions.create({
     model: MODEL,
     system_instruction: SYSTEM_PROMPT,
@@ -435,6 +448,8 @@ async function extractIntent({
   });
 
   const rawText = interaction.output_text || "";
+  console.log("[GEMINI RAW]", rawText);
+
   const normalizedText = String(rawText).trim();
   const fencedMatch = normalizedText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   const jsonText = fencedMatch ? fencedMatch[1].trim() : normalizedText;
@@ -448,12 +463,16 @@ async function extractIntent({
     );
   }
 
-  parsedIntent = normalizeParsedIntent(parsedIntent, extractionText);
-  parsedIntent = preserveExplicitNumericAmounts(
-    parsedIntent,
-    extractionText || parsedIntent.raw_input,
-  );
-  if (audioTranscript) parsedIntent.raw_input = audioTranscript;
+  // For voice notes the transcript only exists after the call, so the
+  // post-processing below falls back to the model's raw_input.
+  const sourceText = text?.trim() || parsedIntent?.raw_input || "";
+
+  parsedIntent = normalizeParsedIntent(parsedIntent, sourceText);
+  parsedIntent = preserveExplicitNumericAmounts(parsedIntent, sourceText);
+
+  if (audioBase64 && !parsedIntent.raw_input) {
+    console.warn("[AUDIO] Gemini returned an empty transcript");
+  }
 
   console.log("Extracted intent:", JSON.stringify(parsedIntent, null, 2));
   return parsedIntent;
